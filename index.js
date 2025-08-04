@@ -142,82 +142,90 @@ app.get("/fetch-rss", async (req, res) => {
   }
 
   try {
-    const response = await axios.get(rssUrl, {
+    // Use rss2json.com to bypass Cloudflare
+    const proxyUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(rssUrl)}`;
+    const response = await axios.get(proxyUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'application/rss+xml, application/xml, text/xml',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Connection': 'keep-alive'
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.5'
       },
       timeout: 10000
     });
-    const parser = new xml2js.Parser();
-    parser.parseString(response.data, async (err, result) => {
-      if (err) {
-        console.error("XML parsing error:", err);
-        return res.status(500).json({ success: false, message: "Failed to parse XML", error: err.message });
+
+    const feed = response.data;
+    if (feed.status !== "ok") {
+      console.error("RSS2JSON error:", feed.message);
+      return res.status(500).json({ success: false, message: "Failed to fetch RSS feed via proxy", error: feed.message });
+    }
+
+    if (!feed.items || feed.items.length === 0) {
+      console.error("No items found in RSS feed:", rssUrl);
+      return res.status(200).json({ success: true, message: "No items in RSS feed", data: [], totalItems: 0 });
+    }
+
+    const items = feed.items.map((item) => ({
+      article_id: generateArticleId(item.link),
+      title: item.title || "Untitled",
+      link: item.link,
+      keywords: item.categories || null,
+      creator: item.author ? [item.author] : ["Unknown"],
+      video_url: null,
+      description: item.description ? stripHtmlTags(item.description) : "No description available",
+      content: item.content ? stripHtmlTags(item.content) : null,
+      pubDate: formatDate(item.pubDate) || new Date().toISOString(),
+      pubDateTZ: "UTC",
+      image_url: item.thumbnail || "/default.png?height=200&width=400&text=News",
+      source_id: generateSourceId(rssUrl),
+      source_priority: Math.floor(Math.random() * 1000000) + 1000,
+      source_name: feed.feed.title || "CryptoSlate",
+      source_url: feed.feed.link || rssUrl,
+      source_icon: null,
+      language: "english",
+      country: ["global"],
+      category: ["cryptocurrency"],
+      ai_tag: ["crypto news"],
+      ai_region: null,
+      ai_org: null,
+    }));
+
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + limit;
+    const paginatedItems = items.slice(startIndex, endIndex);
+
+    const db = await connectToDatabase();
+    const collection = db.collection(collectionName);
+
+    // Bulk check for duplicates
+    const existingLinks = new Set(
+      (await collection.find({ link: { $in: items.map(item => item.link) } })
+        .project({ link: 1 })
+        .toArray())
+        .map(item => item.link)
+    );
+    const newItems = paginatedItems.filter(item => !existingLinks.has(item.link));
+
+    if (newItems.length > 0) {
+      const result = await collection.insertMany(newItems, { ordered: false });
+      console.log(`Inserted ${result.insertedCount} new articles into ${collectionName}`);
+    } else {
+      console.log(`No new articles to insert into ${collectionName}`);
+    }
+
+    // Log duplicates
+    paginatedItems.forEach(item => {
+      if (existingLinks.has(item.link)) {
+        console.log(`Duplicate article found: ${item.title} in ${collectionName}`);
       }
+    });
 
-      if (!result.rss || !result.rss.channel || !result.rss.channel[0].item) {
-        console.error("No items found in RSS feed:", rssUrl);
-        return res.status(200).json({ success: true, message: "No items in RSS feed", data: [], totalItems: 0 });
-      }
-
-      const items = result.rss.channel[0].item.map((item) => ({
-        article_id: generateArticleId(item.link[0]),
-        title: item.title[0] || "Untitled",
-        link: item.link[0],
-        keywords: null,
-        creator: item["dc:creator"] ? [item["dc:creator"][0] || "Unknown"] : ["Unknown"],
-        video_url: null,
-        description: item.description ? stripHtmlTags(item.description[0]) : "No description available",
-        content: item["content:encoded"] ? stripHtmlTags(item["content:encoded"][0]) : null,
-        pubDate: formatDate(item.pubDate[0]) || new Date().toISOString(),
-        pubDateTZ: "UTC",
-        image_url: extractImageUrl(item) || "/default.png?height=200&width=400&text=News",
-        source_id: generateSourceId(rssUrl),
-        source_priority: Math.floor(Math.random() * 1000000) + 1000,
-        source_name: result.rss.channel[0].title[0],
-        source_url: result.rss.channel[0].link[0],
-        source_icon: null,
-        language: "english",
-        country: ["global"],
-        category: ["cryptocurrency"],
-        ai_tag: ["crypto news"],
-        ai_region: null,
-        ai_org: null,
-      }));
-
-      const startIndex = (page - 1) * limit;
-      const endIndex = startIndex + limit;
-      const paginatedItems = items.slice(startIndex, endIndex);
-
-      const db = await connectToDatabase();
-      const collection = db.collection(collectionName);
-
-      for (const item of paginatedItems) {
-        try {
-          const existingItem = await collection.findOne({ link: item.link });
-          if (!existingItem) {
-            await collection.insertOne(item);
-            console.log(`Inserted article: ${item.title} into ${collectionName}`);
-          } else {
-            console.log(`Duplicate article found: ${item.title} in ${collectionName}`);
-          }
-        } catch (error) {
-          console.error(`Failed to insert article ${item.title} into ${collectionName}:`, error.message);
-          throw error;
-        }
-      }
-
-      res.status(200).json({
-        success: true,
-        message: `Fetched and processed RSS feed items from ${rssUrl}`,
-        data: paginatedItems,
-        totalItems: items.length,
-        currentPage: page,
-        totalPages: Math.ceil(items.length / limit),
-      });
+    res.status(200).json({
+      success: true,
+      message: `Fetched and processed RSS feed items from ${rssUrl}`,
+      data: paginatedItems,
+      totalItems: items.length,
+      currentPage: page,
+      totalPages: Math.ceil(items.length / limit),
     });
   } catch (error) {
     console.error("Error in /fetch-rss:", error.message);
@@ -239,9 +247,6 @@ app.get("/fetch-another-rss", async (req, res) => {
   const limit = parseInt(req.query.limit) || 5;
 
   try {
-    // Optional: Use proxy if 403 persists
-    // const proxyUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(rssUrl)}`;
-    // const response = await axios.get(proxyUrl, { headers: { 'User-Agent': '...' } });
     const response = await axios.get(rssUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -295,20 +300,28 @@ app.get("/fetch-another-rss", async (req, res) => {
       const db = await connectToDatabase();
       const collection = db.collection(collectionName);
 
-      for (const item of paginatedItems) {
-        try {
-          const existingItem = await collection.findOne({ link: item.link });
-          if (!existingItem) {
-            await collection.insertOne(item);
-            console.log(`Inserted article: ${item.title} into ${collectionName}`);
-          } else {
-            console.log(`Duplicate article found: ${item.title} in ${collectionName}`);
-          }
-        } catch (error) {
-          console.error(`Failed to insert article ${item.title} into ${collectionName}:`, error.message);
-          throw error;
-        }
+      // Bulk check for duplicates
+      const existingLinks = new Set(
+        (await collection.find({ link: { $in: items.map(item => item.link) } })
+          .project({ link: 1 })
+          .toArray())
+        .map(item => item.link)
+      );
+      const newItems = paginatedItems.filter(item => !existingLinks.has(item.link));
+
+      if (newItems.length > 0) {
+        const result = await collection.insertMany(newItems, { ordered: false });
+        console.log(`Inserted ${result.insertedCount} new articles into ${collectionName}`);
+      } else {
+        console.log(`No new articles to insert into ${collectionName}`);
       }
+
+      // Log duplicates
+      paginatedItems.forEach(item => {
+        if (existingLinks.has(item.link)) {
+          console.log(`Duplicate article found: ${item.title} in ${collectionName}`);
+        }
+      });
 
       res.status(200).json({
         success: true,
@@ -538,7 +551,7 @@ function stripHtmlTags(html) {
     .trim();
 }
 
-const PORT = process.env.PORT || 10000; // Updated to match Render logs
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, async () => {
   try {
     await connectToDatabase();
